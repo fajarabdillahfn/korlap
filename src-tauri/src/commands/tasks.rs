@@ -52,14 +52,8 @@ pub fn list_tasks(repo_id: String, state: State<AppState>) -> Result<Vec<Task>, 
     Ok(tasks)
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CreateTaskPayload {
-    pub repo_id: String,
-    pub title: String,
-}
-
 #[tauri::command]
-pub fn create_task(payload: CreateTaskPayload, state: State<AppState>) -> Result<Task, String> {
+pub fn create_task(repo_id: String, title: String, state: State<AppState>) -> Result<Task, String> {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -67,14 +61,14 @@ pub fn create_task(payload: CreateTaskPayload, state: State<AppState>) -> Result
     db.execute(
         "INSERT INTO tasks (id, repo_id, title, status, created_at, updated_at)
          VALUES (?1, ?2, ?3, 'todo', ?4, ?5)",
-        params![id, payload.repo_id, payload.title, now, now],
+        params![id, repo_id, title, now, now],
     )
     .map_err(|e| e.to_string())?;
 
     Ok(Task {
         id,
-        repo_id: payload.repo_id,
-        title: payload.title,
+        repo_id,
+        title,
         status: "todo".to_string(),
         branch_name: None,
         worktree_path: None,
@@ -83,16 +77,11 @@ pub fn create_task(payload: CreateTaskPayload, state: State<AppState>) -> Result
     })
 }
 
-#[derive(Debug, Deserialize)]
-pub struct UpdateTaskStatusPayload {
-    pub task_id: String,
-    pub status: String,
-    pub branch_name: Option<String>,
-}
-
 #[tauri::command]
 pub fn update_task_status(
-    payload: UpdateTaskStatusPayload,
+    task_id: String,
+    status: String,
+    branch_name: Option<String>,
     state: State<AppState>,
 ) -> Result<TaskWithDiff, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -103,7 +92,7 @@ pub fn update_task_status(
             "SELECT t.status, t.branch_name, r.root_path
              FROM tasks t JOIN repos r ON t.repo_id = r.id
              WHERE t.id = ?1",
-            params![payload.task_id],
+            params![task_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| match e {
@@ -116,21 +105,20 @@ pub fn update_task_status(
 
     // Validate forward-only transition
     let valid = matches!(
-        (current_status, payload.status.as_str()),
+        (current_status, status.as_str()),
         ("todo", "in_progress") | ("in_progress", "review") | ("review", "done")
     );
     if !valid {
         return Err(format!(
             "Invalid status transition: {} → {}",
-            current_status, payload.status
+            current_status, status
         ));
     }
 
     let now = chrono::Utc::now().to_rfc3339();
 
-    if payload.status == "in_progress" {
-        let branch_name = payload
-            .branch_name
+    if status == "in_progress" {
+        let branch_name = branch_name
             .as_deref()
             .filter(|s| !s.is_empty())
             .ok_or("branch_name is required when moving to in_progress")?;
@@ -142,14 +130,14 @@ pub fn update_task_status(
             .unwrap_or(&repo_root)
             .join(".korlap-worktrees");
         let worktree_path = worktree_base
-            .join(&payload.task_id)
+            .join(&task_id)
             .to_string_lossy()
             .to_string();
 
         db.execute(
             "UPDATE tasks SET status = ?1, branch_name = ?2, worktree_path = ?3, updated_at = ?4
              WHERE id = ?5",
-            params![payload.status, branch_name, worktree_path, now, payload.task_id],
+            params![status, branch_name, worktree_path, now, task_id],
         )
         .map_err(|e| e.to_string())?;
 
@@ -166,23 +154,23 @@ pub fn update_task_status(
             // Roll back DB update — surface rollback failure alongside git error
             let rollback_note = db.execute(
                 "UPDATE tasks SET status = 'todo', branch_name = NULL, worktree_path = NULL, updated_at = ?1 WHERE id = ?2",
-                params![chrono::Utc::now().to_rfc3339(), payload.task_id],
+                params![chrono::Utc::now().to_rfc3339(), task_id],
             ).err().map(|e| format!(" (rollback also failed: {})", e)).unwrap_or_default();
             return Err(format!("Failed to create git worktree: {}{}", git_err, rollback_note));
         }
     } else {
         db.execute(
             "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![payload.status, now, payload.task_id],
+            params![status, now, task_id],
         )
         .map_err(|e| e.to_string())?;
     }
 
     // Capture diff when transitioning to 'review'
-    let diff = if payload.status == "review" {
+    let diff = if status == "review" {
         let branch_name: Option<String> = db.query_row(
             "SELECT branch_name FROM tasks WHERE id = ?1",
-            params![payload.task_id],
+            params![task_id],
             |row| row.get(0),
         ).ok().flatten();
 
@@ -198,10 +186,10 @@ pub fn update_task_status(
     };
 
     // Worktree + branch cleanup when transitioning to 'done'
-    if payload.status == "done" {
+    if status == "done" {
         let (branch_name, worktree_path_opt): (Option<String>, Option<String>) = db.query_row(
             "SELECT branch_name, worktree_path FROM tasks WHERE id = ?1",
-            params![payload.task_id],
+            params![task_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).map_err(|e| e.to_string())?;
 
@@ -221,7 +209,7 @@ pub fn update_task_status(
                 // Merge conflict or failure — roll back to 'review'
                 let _ = db.execute(
                     "UPDATE tasks SET status = 'review', updated_at = ?1 WHERE id = ?2",
-                    params![chrono::Utc::now().to_rfc3339(), payload.task_id],
+                    params![chrono::Utc::now().to_rfc3339(), task_id],
                 );
                 return Err(format!("Merge failed: {}. Task remains in REVIEW.", merge_err));
             }
@@ -240,7 +228,7 @@ pub fn update_task_status(
     let updated_task = db.query_row(
         "SELECT id, repo_id, title, status, branch_name, worktree_path, created_at, updated_at
          FROM tasks WHERE id = ?1",
-        params![payload.task_id],
+        params![task_id],
         |row| {
             Ok(Task {
                 id: row.get(0)?,
@@ -259,13 +247,8 @@ pub fn update_task_status(
     Ok(TaskWithDiff { task: updated_task, diff })
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DeleteTaskPayload {
-    pub task_id: String,
-}
-
 #[tauri::command]
-pub fn delete_task(payload: DeleteTaskPayload, state: State<AppState>) -> Result<(), String> {
+pub fn delete_task(task_id: String, state: State<AppState>) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
     // Fetch task info + repo root before deleting
@@ -273,12 +256,12 @@ pub fn delete_task(payload: DeleteTaskPayload, state: State<AppState>) -> Result
         "SELECT t.branch_name, t.worktree_path, r.root_path
          FROM tasks t JOIN repos r ON t.repo_id = r.id
          WHERE t.id = ?1",
-        params![payload.task_id],
+        params![task_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).ok();
 
     let rows = db
-        .execute("DELETE FROM tasks WHERE id = ?1", params![payload.task_id])
+        .execute("DELETE FROM tasks WHERE id = ?1", params![task_id])
         .map_err(|e| e.to_string())?;
 
     if rows == 0 {

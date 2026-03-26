@@ -42,24 +42,19 @@ pub fn list_messages(task_id: String, state: State<AppState>) -> Result<Vec<Mess
     Ok(messages)
 }
 
-#[derive(Debug, Deserialize)]
-pub struct InsertMessagePayload {
-    pub task_id: String,
-    pub role: String,
-    pub content: String,
-    pub tool_calls: Option<String>,
-}
-
 #[tauri::command]
 pub fn insert_message(
-    payload: InsertMessagePayload,
+    task_id: String,
+    role: String,
+    content: String,
+    tool_calls: Option<String>,
     state: State<AppState>,
 ) -> Result<Message, String> {
     let valid_roles = ["user", "assistant", "system"];
-    if !valid_roles.contains(&payload.role.as_str()) {
+    if !valid_roles.contains(&role.as_str()) {
         return Err(format!(
             "Invalid role '{}'. Must be one of: user, assistant, system",
-            payload.role
+            role
         ));
     }
 
@@ -70,16 +65,16 @@ pub fn insert_message(
     db.execute(
         "INSERT INTO messages (id, task_id, role, content, tool_calls, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, payload.task_id, payload.role, payload.content, payload.tool_calls, now],
+        params![id, task_id, role, content, tool_calls, now],
     )
     .map_err(|e| e.to_string())?;
 
     Ok(Message {
         id,
-        task_id: payload.task_id,
-        role: payload.role,
-        content: payload.content,
-        tool_calls: payload.tool_calls,
+        task_id,
+        role,
+        content,
+        tool_calls,
         created_at: now,
     })
 }

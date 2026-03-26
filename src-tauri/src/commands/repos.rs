@@ -33,14 +33,9 @@ pub fn list_repos(state: State<AppState>) -> Result<Vec<Repo>, String> {
     Ok(repos)
 }
 
-#[derive(Debug, Deserialize)]
-pub struct AddRepoPayload {
-    pub path: String,
-}
-
 #[tauri::command]
-pub fn add_repo(payload: AddRepoPayload, state: State<AppState>) -> Result<Repo, String> {
-    let root_path = payload.path;
+pub fn add_repo(path: String, state: State<AppState>) -> Result<Repo, String> {
+    let root_path = path;
 
     // Validate: directory exists
     let path = std::path::Path::new(&root_path);

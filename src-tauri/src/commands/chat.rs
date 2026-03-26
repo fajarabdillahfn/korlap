@@ -17,16 +17,6 @@ pub type ToolPendingState = Arc<Mutex<HashMap<String, Vec<PendingToolCall>>>>;
 /// to DB only when every call in the batch is resolved.
 pub type ToolResultsBuffer = Arc<Mutex<HashMap<String, Vec<Value>>>>;
 
-// ---------------------------------------------------------------------------
-// Payload types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub struct SendChatPayload {
-    pub task_id: String,
-    pub content: String,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ToolCallInfo {
     pub id: String,
@@ -38,19 +28,6 @@ pub struct ToolCallInfo {
 struct ToolCallsEvent {
     task_id: String,
     tool_calls: Vec<ToolCallInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ApproveToolCallPayload {
-    pub task_id: String,
-    pub tool_use_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RejectToolCallPayload {
-    pub task_id: String,
-    pub tool_use_id: String,
-    pub reason: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +259,8 @@ async fn continue_after_tool_batch(
 
 #[tauri::command]
 pub async fn send_chat_message(
-    payload: SendChatPayload,
+    task_id: String,
+    content: String,
     app: AppHandle,
     state: State<'_, AppState>,
     tool_state: State<'_, ToolPendingState>,
@@ -292,11 +270,11 @@ pub async fn send_chat_message(
 
     let messages = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        let history = load_claude_messages(&db, &payload.task_id)?;
+        let history = load_claude_messages(&db, &task_id)?;
         // Save original content to DB (clean history without injected file blobs)
-        save_message(&db, &payload.task_id, "user", &Value::String(payload.content.clone()))?;
+        save_message(&db, &task_id, "user", &Value::String(content.clone()))?;
         // Augment with @file context for Claude (not persisted)
-        let augmented = inject_file_context(&db, &payload.task_id, &payload.content);
+        let augmented = inject_file_context(&db, &task_id, &content);
         let mut messages = history;
         messages.push(ClaudeMessage {
             role: "user".to_string(),
@@ -305,7 +283,6 @@ pub async fn send_chat_message(
         messages
     };
 
-    let task_id = payload.task_id.clone();
     let db_arc = state.inner().db.clone();
     let tool_state_arc = tool_state.inner().clone();
     let results_buffer_arc = results_buffer.inner().clone();
@@ -339,34 +316,33 @@ pub async fn send_chat_message(
 
 #[tauri::command]
 pub async fn approve_tool_call(
-    payload: ApproveToolCallPayload,
+    task_id: String,
+    tool_use_id: String,
     app: AppHandle,
     state: State<'_, AppState>,
     tool_state: State<'_, ToolPendingState>,
     results_buffer: State<'_, ToolResultsBuffer>,
 ) -> Result<(), String> {
-    // Remove this call from pending state; determine atomically if it's the last.
     let (tool_call, is_last) = {
         let mut pending = tool_state.lock().map_err(|e| e.to_string())?;
         let calls = pending
-            .get_mut(&payload.task_id)
-            .ok_or_else(|| format!("No pending tool calls for task {}", payload.task_id))?;
+            .get_mut(&task_id)
+            .ok_or_else(|| format!("No pending tool calls for task {}", task_id))?;
         let pos = calls
             .iter()
-            .position(|c| c.id == payload.tool_use_id)
-            .ok_or_else(|| format!("Tool use id {} not found", payload.tool_use_id))?;
+            .position(|c| c.id == tool_use_id)
+            .ok_or_else(|| format!("Tool use id {} not found", tool_use_id))?;
         let call = calls.remove(pos);
         let is_last = calls.is_empty();
         if is_last {
-            pending.remove(&payload.task_id);
+            pending.remove(&task_id);
         }
         (call, is_last)
     };
 
-    // Get worktree path
     let worktree_path = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        get_worktree_path(&db, &payload.task_id)?
+        get_worktree_path(&db, &task_id)?
     };
 
     // Execute the tool
@@ -402,16 +378,16 @@ pub async fn approve_tool_call(
     // Buffer this tool result
     let tool_result_block = json!({
         "type": "tool_result",
-        "tool_use_id": payload.tool_use_id,
+        "tool_use_id": tool_use_id,
         "content": result_text,
     });
 
     let all_results = {
         let mut buf = results_buffer.lock().map_err(|e| e.to_string())?;
-        let entry = buf.entry(payload.task_id.clone()).or_default();
+        let entry = buf.entry(task_id.clone()).or_default();
         entry.push(tool_result_block);
         if is_last {
-            buf.remove(&payload.task_id).unwrap_or_default()
+            buf.remove(&task_id).unwrap_or_default()
         } else {
             Vec::new() // more calls pending — don't continue yet
         }
@@ -422,7 +398,7 @@ pub async fn approve_tool_call(
         let tool_state_arc = tool_state.inner().clone();
         let results_buffer_arc = results_buffer.inner().clone();
         continue_after_tool_batch(
-            payload.task_id,
+            task_id,
             all_results,
             app,
             db_arc,
@@ -437,7 +413,9 @@ pub async fn approve_tool_call(
 
 #[tauri::command]
 pub async fn reject_tool_call(
-    payload: RejectToolCallPayload,
+    task_id: String,
+    tool_use_id: String,
+    reason: String,
     app: AppHandle,
     state: State<'_, AppState>,
     tool_state: State<'_, ToolPendingState>,
@@ -446,33 +424,33 @@ pub async fn reject_tool_call(
     let is_last = {
         let mut pending = tool_state.lock().map_err(|e| e.to_string())?;
         let calls = pending
-            .get_mut(&payload.task_id)
-            .ok_or_else(|| format!("No pending tool calls for task {}", payload.task_id))?;
+            .get_mut(&task_id)
+            .ok_or_else(|| format!("No pending tool calls for task {}", task_id))?;
         let pos = calls
             .iter()
-            .position(|c| c.id == payload.tool_use_id)
-            .ok_or_else(|| format!("Tool use id {} not found", payload.tool_use_id))?;
+            .position(|c| c.id == tool_use_id)
+            .ok_or_else(|| format!("Tool use id {} not found", tool_use_id))?;
         calls.remove(pos);
         let is_last = calls.is_empty();
         if is_last {
-            pending.remove(&payload.task_id);
+            pending.remove(&task_id);
         }
         is_last
     };
 
     let rejection_block = json!({
         "type": "tool_result",
-        "tool_use_id": payload.tool_use_id,
-        "content": format!("User rejected this tool call. Reason: {}", payload.reason),
+        "tool_use_id": tool_use_id,
+        "content": format!("User rejected this tool call. Reason: {}", reason),
         "is_error": true,
     });
 
     let all_results = {
         let mut buf = results_buffer.lock().map_err(|e| e.to_string())?;
-        let entry = buf.entry(payload.task_id.clone()).or_default();
+        let entry = buf.entry(task_id.clone()).or_default();
         entry.push(rejection_block);
         if is_last {
-            buf.remove(&payload.task_id).unwrap_or_default()
+            buf.remove(&task_id).unwrap_or_default()
         } else {
             Vec::new()
         }
@@ -483,7 +461,7 @@ pub async fn reject_tool_call(
         let tool_state_arc = tool_state.inner().clone();
         let results_buffer_arc = results_buffer.inner().clone();
         continue_after_tool_batch(
-            payload.task_id,
+            task_id,
             all_results,
             app,
             db_arc,

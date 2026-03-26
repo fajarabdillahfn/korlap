@@ -1,7 +1,6 @@
 use crate::commands::tools::read_file_from_worktree;
 use crate::state::AppState;
 use rusqlite::params;
-use serde::Deserialize;
 use std::process::Command;
 use tauri::State;
 
@@ -16,23 +15,15 @@ fn get_worktree_path(db: &rusqlite::Connection, task_id: &str) -> Result<String,
     .ok_or_else(|| format!("Task {} has no active worktree", task_id))
 }
 
-#[derive(Deserialize)]
-pub struct ListWorktreeFilesPayload {
-    pub task_id: String,
-    pub query: String,
-}
-
-/// List files tracked by git in the task's worktree.
-/// Respects .gitignore automatically (git ls-files only shows tracked/staged files).
-/// Returns at most 20 matches.
 #[tauri::command]
 pub fn list_worktree_files(
-    payload: ListWorktreeFilesPayload,
+    task_id: String,
+    query: String,
     state: State<AppState>,
 ) -> Result<Vec<String>, String> {
     let worktree_path = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        get_worktree_path(&db, &payload.task_id)?
+        get_worktree_path(&db, &task_id)?
     };
 
     let output = Command::new("git")
@@ -47,13 +38,13 @@ pub fn list_worktree_files(
         .map(|l| l.to_string())
         .collect();
 
-    let query = payload.query.to_lowercase();
-    let results: Vec<String> = if query.is_empty() {
+    let q = query.to_lowercase();
+    let results: Vec<String> = if q.is_empty() {
         all_files.into_iter().take(20).collect()
     } else {
         all_files
             .into_iter()
-            .filter(|f| f.to_lowercase().contains(&query))
+            .filter(|f| f.to_lowercase().contains(&q))
             .take(20)
             .collect()
     };
@@ -61,23 +52,17 @@ pub fn list_worktree_files(
     Ok(results)
 }
 
-#[derive(Deserialize)]
-pub struct ReadFileContentPayload {
-    pub task_id: String,
-    pub file_path: String,
-    pub full: bool,
-}
-
-/// Read a file from the task's worktree. Uses the same path-security logic as the tool handler.
 #[tauri::command]
 pub fn read_file_content(
-    payload: ReadFileContentPayload,
+    task_id: String,
+    file_path: String,
+    full: bool,
     state: State<AppState>,
 ) -> Result<String, String> {
     let worktree_path = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        get_worktree_path(&db, &payload.task_id)?
+        get_worktree_path(&db, &task_id)?
     };
 
-    read_file_from_worktree(&worktree_path, &payload.file_path, payload.full)
+    read_file_from_worktree(&worktree_path, &file_path, full)
 }
